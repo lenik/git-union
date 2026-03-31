@@ -1,0 +1,17 @@
+Source: git-union
+Section: vcs
+Priority: optional
+Maintainer: Lenik <git-union@bodz.net>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://bodz.net/
+
+Package: git-union
+Architecture: all
+Depends: ${misc:Depends}, git, python3
+Description: merge multiple git repositories into one monorepo
+ git-union creates a new git repository and replays commits from multiple
+ source repositories, placing each source under its own subdirectory.
+ It supports optional cross-repository commit interleaving by author time
+ while preserving per-repository commit order.

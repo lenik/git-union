@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+@dataclass
+class RepoSpec:
+    name: str
+    path: Path
+
+
+@dataclass
+class CommitInfo:
+    repo_idx: int
+    repo_name: str
+    repo_path: Path
+    commit: str
+    author_time: int
+    author_name: str
+    author_email: str
+    author_date_iso: str
+    committer_name: str
+    committer_email: str
+    committer_date_iso: str
+    message: str
+
+
+class GitUnionError(Exception):
+    pass
+
+
+def run_git(args: List[str], cwd: Path, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    cmd = ["git", *args]
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        check=check,
+        text=True,
+        capture_output=capture,
+    )
+
+
+def run_git_bytes(args: List[str], cwd: Path) -> subprocess.CompletedProcess:
+    cmd = ["git", *args]
+    return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True)
+
+
+def parse_repo_arg(raw: str) -> Tuple[str, str]:
+    if "=" in raw:
+        name, path = raw.split("=", 1)
+        name = name.strip()
+        path = path.strip()
+        if not name:
+            raise GitUnionError(f"Invalid repo mapping '{raw}': name is empty")
+        if not path:
+            raise GitUnionError(f"Invalid repo mapping '{raw}': path is empty")
+        return name, path
+    p = raw.strip()
+    if not p:
+        raise GitUnionError("Empty repo argument")
+    return os.path.basename(os.path.normpath(p)), p
+
+
+def ensure_git_repo(path: Path) -> None:
+    if not path.exists():
+        raise GitUnionError(f"Repository path does not exist: {path}")
+    try:
+        run_git(["rev-parse", "--git-dir"], cwd=path)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise GitUnionError(f"Not a git repository: {path}\n{stderr}") from exc
+
+
+def collect_commits(spec: RepoSpec, repo_idx: int) -> List[CommitInfo]:
+    revs = run_git(["rev-list", "--reverse", "HEAD"], cwd=spec.path).stdout.splitlines()
+    items: List[CommitInfo] = []
+    for commit in revs:
+        fmt = "%at%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B"
+        out = run_git(["show", "-s", f"--format={fmt}", commit], cwd=spec.path).stdout
+        parts = out.split("\x00", 7)
+        if len(parts) != 8:
+            raise GitUnionError(f"Unexpected git show format while reading {spec.name}:{commit}")
+        author_time = int(parts[0].strip())
+        items.append(
+            CommitInfo(
+                repo_idx=repo_idx,
+                repo_name=spec.name,
+                repo_path=spec.path,
+                commit=commit,
+                author_time=author_time,
+                author_name=parts[1].strip(),
+                author_email=parts[2].strip(),
+                author_date_iso=parts[3].strip(),
+                committer_name=parts[4].strip(),
+                committer_email=parts[5].strip(),
+                committer_date_iso=parts[6].strip(),
+                message=parts[7],
+            )
+        )
+    return items
+
+
+def schedule_commits(per_repo: List[List[CommitInfo]], do_sort: bool) -> List[CommitInfo]:
+    if not do_sort:
+        merged: List[CommitInfo] = []
+        for seq in per_repo:
+            merged.extend(seq)
+        return merged
+
+    positions = [0 for _ in per_repo]
+    out: List[CommitInfo] = []
+    while True:
+        candidates: List[CommitInfo] = []
+        for idx, seq in enumerate(per_repo):
+            pos = positions[idx]
+            if pos < len(seq):
+                candidates.append(seq[pos])
+        if not candidates:
+            break
+        # Preserve each repo's order by only considering each queue head.
+        # Tie-break with repo index for deterministic output.
+        chosen = min(candidates, key=lambda c: (c.author_time, c.repo_idx))
+        out.append(chosen)
+        positions[chosen.repo_idx] += 1
+    return out
+
+
+def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
+    # Returns tuples: (status, path_a, path_b_for_rename_or_copy)
+    tokens = raw.split(b"\x00")
+    if tokens and tokens[-1] == b"":
+        tokens = tokens[:-1]
+    i = 0
+    out: List[Tuple[str, str, Optional[str]]] = []
+    while i < len(tokens):
+        st = tokens[i].decode("utf-8", errors="replace")
+        i += 1
+        if not st:
+            continue
+        code = st[0]
+        if code in ("R", "C"):
+            if i + 1 >= len(tokens):
+                raise GitUnionError("Malformed name-status -z output for rename/copy")
+            old_path = tokens[i].decode("utf-8", errors="surrogateescape")
+            new_path = tokens[i + 1].decode("utf-8", errors="surrogateescape")
+            i += 2
+            out.append((code, old_path, new_path))
+        else:
+            if i >= len(tokens):
+                raise GitUnionError("Malformed name-status -z output")
+            p = tokens[i].decode("utf-8", errors="surrogateescape")
+            i += 1
+            out.append((code, p, None))
+    return out
+
+
+def safe_relpath(path: str) -> Path:
+    p = Path(path)
+    if p.is_absolute():
+        raise GitUnionError(f"Absolute path encountered in commit diff: {path}")
+    norm = Path(os.path.normpath(path))
+    if str(norm).startswith(".."):
+        raise GitUnionError(f"Path escapes repo root in commit diff: {path}")
+    return norm
+
+
+def write_file_from_commit(repo_path: Path, commit: str, src_path: str, dest_path: Path) -> None:
+    try:
+        blob = run_git_bytes(["show", f"{commit}:{src_path}"], cwd=repo_path).stdout
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise GitUnionError(f"Failed reading blob {commit}:{src_path}\n{stderr}") from exc
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest_path, "wb") as fh:
+        fh.write(blob)
+
+
+def apply_commit_into_monorepo(mono_dir: Path, info: CommitInfo, verbose: bool = False) -> bool:
+    status_raw = run_git_bytes(
+        ["diff-tree", "--root", "--no-commit-id", "--name-status", "-r", "-z", info.commit],
+        cwd=info.repo_path,
+    ).stdout
+    changes = parse_name_status_z(status_raw)
+    repo_prefix = mono_dir / info.repo_name
+    touched = False
+
+    for code, p1, p2 in changes:
+        if code == "D":
+            dst = repo_prefix / safe_relpath(p1)
+            if dst.exists():
+                if dst.is_dir():
+                    shutil.rmtree(dst)
+                else:
+                    dst.unlink()
+                touched = True
+            continue
+
+        if code == "R":
+            old_dst = repo_prefix / safe_relpath(p1)
+            if old_dst.exists():
+                if old_dst.is_dir():
+                    shutil.rmtree(old_dst)
+                else:
+                    old_dst.unlink()
+                touched = True
+            assert p2 is not None
+            new_dst = repo_prefix / safe_relpath(p2)
+            write_file_from_commit(info.repo_path, info.commit, p2, new_dst)
+            touched = True
+            continue
+
+        if code == "C":
+            assert p2 is not None
+            dst = repo_prefix / safe_relpath(p2)
+            write_file_from_commit(info.repo_path, info.commit, p2, dst)
+            touched = True
+            continue
+
+        # A, M, T and any unknown non-delete status: materialize commit's file content.
+        dst = repo_prefix / safe_relpath(p1)
+        write_file_from_commit(info.repo_path, info.commit, p1, dst)
+        touched = True
+
+    if not touched:
+        if verbose:
+            print(f"[skip] {info.repo_name} {info.commit[:12]} empty/no-op")
+        return False
+
+    run_git(["add", "-A"], cwd=mono_dir, capture=True)
+    try:
+        parent = run_git(["rev-parse", "--verify", "HEAD"], cwd=mono_dir, check=False).returncode == 0
+        if parent:
+            diff = run_git(["diff", "--cached", "--quiet"], cwd=mono_dir, check=False)
+            if diff.returncode == 0:
+                if verbose:
+                    print(f"[skip] {info.repo_name} {info.commit[:12]} no staged changes")
+                return False
+    except subprocess.CalledProcessError:
+        pass
+
+    env = os.environ.copy()
+    env["GIT_AUTHOR_NAME"] = info.author_name
+    env["GIT_AUTHOR_EMAIL"] = info.author_email
+    env["GIT_AUTHOR_DATE"] = info.author_date_iso
+    env["GIT_COMMITTER_NAME"] = info.committer_name
+    env["GIT_COMMITTER_EMAIL"] = info.committer_email
+    env["GIT_COMMITTER_DATE"] = info.committer_date_iso
+
+    msg = info.message.rstrip("\n") + "\n"
+    subprocess.run(
+        ["git", "commit", "--allow-empty-message", "-m", msg],
+        cwd=str(mono_dir),
+        check=True,
+        env=env,
+        text=True,
+        capture_output=not verbose,
+    )
+    if verbose:
+        t = datetime.fromtimestamp(info.author_time).isoformat(sep=" ", timespec="seconds")
+        print(f"[commit] {info.repo_name} {info.commit[:12]} @{t}")
+    return True
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="git-union",
+        description="Merge several git repos into one monorepo, placing each repo under a subdirectory.",
+    )
+    p.add_argument("-s", "--sort", action="store_true", help="Sort by author time while preserving per-repo order")
+    p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    p.add_argument("-q", "--quiet", action="store_true", help="Quiet mode")
+    p.add_argument("--version", action="version", version="git-union 0.1.0")
+    p.add_argument("mono_dir", help="Output monorepo directory (must not already exist)")
+    p.add_argument("repos", nargs="+", help="Repo path or name=repo_path")
+    return p
+
+
+def main(argv: List[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.verbose and args.quiet:
+        raise GitUnionError("Cannot use both --verbose and --quiet")
+
+    specs: List[RepoSpec] = []
+    seen_names: Dict[str, Path] = {}
+    for raw in args.repos:
+        name, path_str = parse_repo_arg(raw)
+        path = Path(path_str).resolve()
+        ensure_git_repo(path)
+        if name in seen_names:
+            raise GitUnionError(f"Duplicate subdir name '{name}' for {path} and {seen_names[name]}")
+        seen_names[name] = path
+        specs.append(RepoSpec(name=name, path=path))
+
+    mono_dir = Path(args.mono_dir).resolve()
+    if mono_dir.exists():
+        raise GitUnionError(f"Output directory already exists: {mono_dir}")
+    mono_dir.mkdir(parents=True, exist_ok=False)
+    run_git(["init"], cwd=mono_dir)
+
+    if not args.quiet:
+        print(f"Initialized monorepo at {mono_dir}")
+
+    per_repo_commits: List[List[CommitInfo]] = []
+    for idx, spec in enumerate(specs):
+        commits = collect_commits(spec, idx)
+        per_repo_commits.append(commits)
+        if args.verbose and not args.quiet:
+            print(f"[repo] {spec.name}: {len(commits)} commits")
+
+    schedule = schedule_commits(per_repo_commits, args.sort)
+    if args.verbose and not args.quiet:
+        print(f"[plan] applying {len(schedule)} commits")
+
+    written = 0
+    for item in schedule:
+        did = apply_commit_into_monorepo(mono_dir, item, verbose=(args.verbose and not args.quiet))
+        if did:
+            written += 1
+
+    if not args.quiet:
+        print(f"Done. Wrote {written} commits into {mono_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except GitUnionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)

@@ -1,0 +1,52 @@
+.TH GIT-UNION 1 "March 2026" "git-union 0.1.0" "User Commands"
+.SH NAME
+git-union \- merge multiple git repositories into one monorepo
+.SH SYNOPSIS
+.B git-union
+[\fIOPTIONS\fR] \fIMONO-DIR\fR \fIREPOS...\fR
+.SH DESCRIPTION
+\fBgit-union\fR creates a new git repository at \fIMONO-DIR\fR and replays commits
+from each source repository into it.
+.PP
+Each source repository is placed under its own subdirectory:
+.IP \(bu 2
+\fIrepo\fR: subdirectory is the basename of \fIrepo\fR
+.IP \(bu 2
+\fIname=repo\fR: subdirectory is \fIname\fR
+.PP
+With \fB--sort\fR, commits are interleaved by author time while preserving
+the original order of commits within each source repository.
+.SH OPTIONS
+.TP
+.B \-s, \-\-sort
+Sort commits by author time while preserving per-repo order.
+.TP
+.B \-v, \-\-verbose
+Enable verbose output.
+.TP
+.B \-q, \-\-quiet
+Enable quiet output.
+.TP
+.B \-h, \-\-help
+Show help and exit.
+.TP
+.B \-\-version
+Show version and exit.
+.SH EXAMPLES
+.TP
+.B git-union monodir foo bar
+Create \fImonodir\fR and import repositories \fIfoo\fR and \fIbar\fR as
+\fImonodir/foo\fR and \fImonodir/bar\fR.
+.TP
+.B git-union --sort mono core=../core ui=../frontend
+Import named repositories and interleave commits by author time with ordering
+constraints preserved per source repository.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 2
+Invalid arguments or processing error.
+.SH LICENSE
+AGPL-3.0-or-later. See the installed license text or the upstream `LICENSE`.

@@ -1,0 +1,2 @@
+git-union usr/bin/
+git-union.bash usr/share/bash-completion/completions/git-union

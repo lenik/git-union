@@ -1,0 +1,24 @@
+git-union (1.0.0) testing; urgency=medium
+
+  * Initial release of git-union.
+  * Implement Python CLI to merge multiple Git repositories into a new
+    monorepo with per-repository subdirectory mapping.
+  * Add --sort scheduling mode to interleave commits by author time while
+    preserving commit order inside each source repository.
+  * Preserve commit metadata during replay:
+    - author and committer identity
+    - author and committer timestamps
+    - commit message content
+  * Add automated unittest suite for:
+    - basic merge flow
+    - explicit name=repo mapping
+    - --sort ordering constraints
+  * Add Debian packaging metadata and install rules:
+    - install executable script
+    - install bash completion
+    - install man page
+  * Add user documentation in English and Chinese.
+  * Set licensing to AGPL-3.0-or-later and include a non-binding anti-AI
+    policy statement in project documentation.
+
+ -- Lenik (谢继雷) <lenik@bodz.net>  Tue, 31 Mar 2026 18:20:00 +0800
