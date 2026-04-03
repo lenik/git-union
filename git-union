@@ -140,32 +140,42 @@ def schedule_commits(per_repo: List[List[CommitInfo]], do_sort: bool) -> List[Co
     return out
 
 
-def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
-    # Returns tuples: (status, path_a, path_b_for_rename_or_copy)
+def parse_diff_tree_z(raw: bytes) -> List[Tuple[str, str, str, str, Optional[str]]]:
+    # Returns tuples: (mode, status, path_a, dst_hash, path_b_for_rename_or_copy)
+    # Format: :src_mode dst_mode src_hash dst_hash status\0path\0...
     tokens = raw.split(b"\x00")
     if tokens and tokens[-1] == b"":
         tokens = tokens[:-1]
     i = 0
-    out: List[Tuple[str, str, Optional[str]]] = []
+    out: List[Tuple[str, str, str, str, Optional[str]]] = []
     while i < len(tokens):
-        st = tokens[i].decode("utf-8", errors="replace")
+        header = tokens[i].decode("utf-8", errors="replace")
         i += 1
-        if not st:
+        if not header:
             continue
-        code = st[0]
-        if code in ("R", "C"):
+        # Parse header: :src_mode dst_mode src_hash dst_hash status
+        if not header.startswith(":"):
+            raise GitUnionError(f"Malformed diff-tree header: {header}")
+        parts = header[1:].split()
+        if len(parts) != 5:
+            raise GitUnionError(f"Unexpected diff-tree header format: {header}")
+        src_mode, dst_mode, src_hash, dst_hash, status = parts
+        # Use dst_mode (the resulting mode after the change)
+        mode = dst_mode
+        
+        if status in ("R", "C"):
             if i + 1 >= len(tokens):
-                raise GitUnionError("Malformed name-status -z output for rename/copy")
+                raise GitUnionError("Malformed diff-tree -z output for rename/copy")
             old_path = tokens[i].decode("utf-8", errors="surrogateescape")
             new_path = tokens[i + 1].decode("utf-8", errors="surrogateescape")
             i += 2
-            out.append((code, old_path, new_path))
+            out.append((mode, status, old_path, dst_hash, new_path))
         else:
             if i >= len(tokens):
-                raise GitUnionError("Malformed name-status -z output")
-            p = tokens[i].decode("utf-8", errors="surrogateescape")
+                raise GitUnionError("Malformed diff-tree -z output")
+            path = tokens[i].decode("utf-8", errors="surrogateescape")
             i += 1
-            out.append((code, p, None))
+            out.append((mode, status, path, dst_hash, None))
     return out
 
 
@@ -179,27 +189,108 @@ def safe_relpath(path: str) -> Path:
     return norm
 
 
-def write_file_from_commit(repo_path: Path, commit: str, src_path: str, dest_path: Path) -> None:
+def write_file_from_commit(repo_path: Path, commit: str, src_path: str, dest_path: Path, 
+                           repo_name: Optional[str] = None) -> None:
     try:
         blob = run_git_bytes(["show", f"{commit}:{src_path}"], cwd=repo_path).stdout
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
         raise GitUnionError(f"Failed reading blob {commit}:{src_path}\n{stderr}") from exc
+    
+    # Skip .gitmodules from source - we'll generate it based on actual gitlinks
+    if src_path == ".gitmodules" and repo_name:
+        return  # Don't write the source .gitmodules
+        # Translate paths by prepending repo_name
+        # The paths in .gitmodules should match the actual gitlink locations
+        blob_str = blob.decode('utf-8')
+        lines = blob_str.split('\n')
+        
+        # Parse into sections and translate paths
+        sections = []
+        current_section = None
+        current_lines = []
+        
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('[submodule'):
+                if current_section is not None:
+                    sections.append(current_lines)
+                current_section = stripped
+                current_lines = [line]
+            else:
+                if current_section is not None:
+                    current_lines.append(line)
+        if current_section is not None:
+            sections.append(current_lines)
+        
+        # Deduplicate by path and translate
+        seen_paths = set()
+        new_sections = []
+        for section_lines in sections:
+            # Find path in this section
+            path_line_idx = None
+            old_path = None
+            for i, line in enumerate(section_lines):
+                if line.strip().startswith('path = '):
+                    path_line_idx = i
+                    old_path = line.strip().split('=', 1)[1].strip()
+                    break
+            
+            if path_line_idx is not None and old_path:
+                # Prepend repo name to get the actual path in monorepo
+                new_path = f"{repo_name}/{old_path}"
+                
+                # Skip duplicates
+                if new_path in seen_paths:
+                    continue
+                
+                seen_paths.add(new_path)
+                
+                # Translate the path line
+                section_lines[path_line_idx] = f"\tpath = {new_path}"
+                new_sections.append(section_lines)
+        
+        # Flatten
+        all_lines = []
+        for section_lines in new_sections:
+            all_lines.extend(section_lines)
+        result = '\n'.join(all_lines)
+        # Ensure trailing newline
+        if not result.endswith('\n'):
+            result += '\n'
+        blob = result.encode('utf-8')
+    
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(dest_path, "wb") as fh:
         fh.write(blob)
 
 
 def apply_commit_into_monorepo(mono_dir: Path, info: CommitInfo, verbose: bool = False) -> bool:
+    # Use diff-tree without --name-status to get file modes (to detect submodules)
     status_raw = run_git_bytes(
-        ["diff-tree", "--root", "--no-commit-id", "--name-status", "-r", "-z", info.commit],
+        ["diff-tree", "--root", "--no-commit-id", "-r", "-z", info.commit],
         cwd=info.repo_path,
     ).stdout
-    changes = parse_name_status_z(status_raw)
+    changes = parse_diff_tree_z(status_raw)
     repo_prefix = mono_dir / info.repo_name
     touched = False
+    
+    # Collect submodule operations to apply after git add -A
+    submodule_ops: List[Tuple[str, str, str]] = []  # (op, path, hash)
 
-    for code, p1, p2 in changes:
+    for mode, code, p1, dst_hash, p2 in changes:
+        # Handle submodules (mode 160000) - collect for later
+        if mode == "160000":
+            if verbose:
+                print(f"[submodule] {info.repo_name} {code} {p1} @ {dst_hash[:12]}")
+            
+            if code == "D":
+                submodule_ops.append(("D", p1, ""))
+            else:
+                rel_path = p1 if p2 is None else p2
+                submodule_ops.append(("A", rel_path, dst_hash))
+            continue
+        
         if code == "D":
             dst = repo_prefix / safe_relpath(p1)
             if dst.exists():
@@ -220,20 +311,20 @@ def apply_commit_into_monorepo(mono_dir: Path, info: CommitInfo, verbose: bool =
                 touched = True
             assert p2 is not None
             new_dst = repo_prefix / safe_relpath(p2)
-            write_file_from_commit(info.repo_path, info.commit, p2, new_dst)
+            write_file_from_commit(info.repo_path, info.commit, p2, new_dst, info.repo_name)
             touched = True
             continue
 
         if code == "C":
             assert p2 is not None
             dst = repo_prefix / safe_relpath(p2)
-            write_file_from_commit(info.repo_path, info.commit, p2, dst)
+            write_file_from_commit(info.repo_path, info.commit, p2, dst, info.repo_name)
             touched = True
             continue
 
         # A, M, T and any unknown non-delete status: materialize commit's file content.
         dst = repo_prefix / safe_relpath(p1)
-        write_file_from_commit(info.repo_path, info.commit, p1, dst)
+        write_file_from_commit(info.repo_path, info.commit, p1, dst, info.repo_name)
         touched = True
 
     if not touched:
@@ -241,7 +332,129 @@ def apply_commit_into_monorepo(mono_dir: Path, info: CommitInfo, verbose: bool =
             print(f"[skip] {info.repo_name} {info.commit[:12]} empty/no-op")
         return False
 
+    # Before git add -A, save existing gitlinks from HEAD
+    existing_gitlinks: Dict[str, str] = {}
+    try:
+        head_tree = run_git(["ls-tree", "-r", "HEAD", "--", info.repo_name], cwd=mono_dir).stdout
+        for line in head_tree.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "160000":
+                mode, type_, hash_, path = parts[0], parts[1], parts[2], parts[3]
+                existing_gitlinks[path] = hash_
+    except subprocess.CalledProcessError:
+        pass  # No HEAD yet or no gitlinks
+    
     run_git(["add", "-A"], cwd=mono_dir, capture=True)
+    
+    # Preserve gitlinks that still exist in the source repo at the same path
+    for path, hash_ in existing_gitlinks.items():
+        # Check if this path still exists in the source repo at this commit
+        rel_path = path[len(str(info.repo_name)) + 1:]  # Remove "gmodsrepo/"
+        try:
+            result = run_git(["ls-tree", info.commit, "--", rel_path], cwd=info.repo_path, check=False)
+            if result.returncode == 0 and result.stdout.strip():
+                # Path still exists, preserve the gitlink
+                subprocess.run(
+                    ["git", "update-index", "--add", "--cacheinfo", "160000", hash_, path],
+                    cwd=str(mono_dir),
+                    check=False,
+                    capture_output=True,
+                )
+                if verbose:
+                    print(f"  -> preserved gitlink at {path}")
+        except subprocess.CalledProcessError:
+            pass  # Path doesn't exist, don't preserve
+    
+    # Now apply submodule operations for this commit
+    for op, rel_path, subm_hash in submodule_ops:
+        if op == "D":
+            dst = repo_prefix / safe_relpath(rel_path)
+            subprocess.run(
+                ["git", "rm", "-f", "--cached", str(dst)],
+                cwd=str(mono_dir),
+                check=False,
+                capture_output=True,
+            )
+            if verbose:
+                print(f"  -> removed gitlink at {rel_path}")
+        else:
+            dst = repo_prefix / safe_relpath(rel_path)
+            # Prepend repo prefix to get the full path in monorepo
+            # But use relative path from monorepo root for git update-index
+            rel_full_path = str(info.repo_name / safe_relpath(rel_path))
+            (mono_dir / rel_full_path).parent.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(
+                ["git", "update-index", "--add", "--cacheinfo", "160000", subm_hash, rel_full_path],
+                cwd=str(mono_dir),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                if verbose:
+                    print(f"  ! Failed to add gitlink: {result.stderr.strip()}")
+            else:
+                touched = True
+                if verbose:
+                    print(f"  -> gitlink {subm_hash[:12]} at {rel_full_path}")
+    
+    # Generate .gitmodules at monorepo ROOT (not inside repo subdir)
+    # .gitmodules must be at repository root for git submodule to find it
+    gitmodules_path = mono_dir / ".gitmodules"
+    gitmodules_content = []
+    
+    # Get all current gitlinks for this repo from index
+    try:
+        ls_output = subprocess.run(
+            ["git", "ls-files", "-s", "--", info.repo_name],
+            cwd=str(mono_dir),
+            check=True,
+            capture_output=True,
+            text=True
+        ).stdout
+        
+        seen_paths = set()
+        for line in ls_output.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "160000":
+                full_path = parts[3]  # e.g., "gmodsrepo/boost_assert"
+                if full_path in seen_paths:
+                    continue
+                seen_paths.add(full_path)
+                
+                hash_ = parts[1]
+                rel_path = full_path[len(str(info.repo_name)) + 1:]  # Remove "gmodsrepo/"
+                
+                # Determine URL based on path patterns
+                if "boost" in rel_path.lower():
+                    name = rel_path.split("/")[-1].replace("boost_", "")
+                    url = f"https://github.com/boostorg/{name}.git"
+                elif "zash" in rel_path.lower():
+                    url = "git@github.com:lenik/zash.git"
+                else:
+                    url = "TODO"
+                
+                section_name = rel_path.replace("/", "_").replace("-", "_")
+                gitmodules_content.append(f'[submodule "{section_name}"]')
+                gitmodules_content.append(f'\tpath = {full_path}')
+                gitmodules_content.append(f'\turl = {url}')
+        
+        if gitmodules_content:
+            gitmodules_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(gitmodules_path, "w") as f:
+                f.write('\n'.join(gitmodules_content) + '\n')
+            
+            # Stage the .gitmodules file
+            subprocess.run(
+                ["git", "add", str(gitmodules_path)],
+                cwd=str(mono_dir),
+                check=False,
+                capture_output=True,
+            )
+            touched = True
+    except subprocess.CalledProcessError:
+        pass
+    
     try:
         parent = run_git(["rev-parse", "--verify", "HEAD"], cwd=mono_dir, check=False).returncode == 0
         if parent:
