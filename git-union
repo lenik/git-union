@@ -36,8 +36,14 @@ class GitUnionError(Exception):
     pass
 
 
+# Global verbose flag for logging git commands
+_verbose = False
+
+
 def run_git(args: List[str], cwd: Path, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
     cmd = ["git", *args]
+    if _verbose:
+        print(f"[git] cd {cwd} && git {' '.join(args)}", file=sys.stderr)
     return subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -49,6 +55,8 @@ def run_git(args: List[str], cwd: Path, check: bool = True, capture: bool = True
 
 def run_git_bytes(args: List[str], cwd: Path) -> subprocess.CompletedProcess:
     cmd = ["git", *args]
+    if _verbose:
+        print(f"[git] cd {cwd} && git {' '.join(args)}", file=sys.stderr)
     return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True)
 
 
@@ -283,10 +291,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: List[str]) -> int:
+    global _verbose
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.verbose and args.quiet:
         raise GitUnionError("Cannot use both --verbose and --quiet")
+    
+    # Set global verbose flag for git command logging
+    _verbose = args.verbose and not args.quiet
 
     specs: List[RepoSpec] = []
     seen_names: Dict[str, Path] = {}
