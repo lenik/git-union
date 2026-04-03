@@ -9,6 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Version will be substituted by meson during build
+__version__ = "@PROJECT_VERSION@"
+
 
 @dataclass
 class RepoSpec:
@@ -497,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-s", "--sort", action="store_true", help="Sort by author time while preserving per-repo order")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     p.add_argument("-q", "--quiet", action="store_true", help="Quiet mode")
-    p.add_argument("--version", action="version", version="git-union 0.1.0")
+    p.add_argument("--version", action="version", version=f"git-union {__version__}")
     p.add_argument("mono_dir", help="Output monorepo directory (must not already exist)")
     p.add_argument("repos", nargs="+", help="Repo path or name=repo_path")
     return p

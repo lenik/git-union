@@ -1,0 +1,5 @@
+option('bash_completion_dir',
+  type: 'string',
+  value: '',
+  description: 'Directory for bash completion files (default: prefix/share/bash-completion/completions)'
+)

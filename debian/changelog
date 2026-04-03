@@ -1,3 +1,23 @@
+git-union (1.1.0) testing; urgency=medium
+
+  * Add submodule (gitlink) support for monorepo merges:
+    - Refactor diff-tree parser to extract file mode information
+    - Detect and handle submodules (mode 160000) during merge
+    - Preserve existing gitlinks that still exist in source repos
+    - Apply gitlink updates using git update-index --cacheinfo
+    - Generate .gitmodules file at monorepo root based on current gitlinks
+    - Support for Boost libraries, zash repo, and other submodules
+  * Add Meson build system with automatic version extraction:
+    - Create meson.build with project configuration and install rules
+    - Add meson_options.txt for customizable build options
+    - Configure git-union script with PROJECT_VERSION substitution
+    - Automatically extract version from git tags using git describe
+    - Install executable, bash completion, man page, and tests
+  * Update git-union script to use dynamic version from build system
+  * Fix .gitignore to avoid ignoring meson.build
+
+ -- Lenik (谢继雷) <lenik@bodz.net>  Fri, 03 Apr 2026 16:20:00 +0800
+
 git-union (1.0.0) testing; urgency=medium
 
   * Initial release of git-union.

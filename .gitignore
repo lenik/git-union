@@ -27,7 +27,7 @@ Thumbs.db
 
 # Debian build files
 *.deb
-*.build
+*.buildinfo
 *.changes
 *.dsc
 *.tar.gz
